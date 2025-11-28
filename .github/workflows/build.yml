@@ -1,0 +1,153 @@
+name: RustPPSharp Auto Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rustppsharp-release
+  cancel-in-progress: false
+
+jobs:
+  # ================================
+  # TAG 생성 + 중복 체크
+  # ================================
+  versioning:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate version tag
+        id: tag
+        run: |
+          DATE=$(date +"%Y%m%d%H%M")
+          TAG="rustppsharp-${DATE}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          T=${{ steps.tag.outputs.tag }}
+          EXIST=$(gh release view "$T" --json tagName --jq ".tagName" 2>/dev/null || true)
+          if [ "$EXIST" = "$T" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # ================================
+  # 3 OS 빌드
+  # ================================
+  build:
+    needs: versioning
+    if: needs.versioning.outputs.exists == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo build
+        run: cargo build --release
+
+      # -------- Proof ----------
+      - name: Prepare proof
+        run: |
+          mkdir -p proof
+          echo "Rust++# (rustppsharp) Build Proof" > proof/PROOF-${{ matrix.os }}.txt
+          echo "Tag: ${{ needs.versioning.outputs.tag }}" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "Commit: $GITHUB_SHA" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "Build OS: ${{ matrix.os }}" >> proof/PROOF-${{ matrix.os }}.txt
+          echo "Build Time: $(date)" >> proof/PROOF-${{ matrix.os }}.txt
+
+      # -------- SHA256 ----------
+      - name: SHA256 (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "SHA256 Checksums" > proof/SHA256-${{ matrix.os }}.txt
+          find target/release -maxdepth 1 -type f -exec sha256sum {} \; >> proof/SHA256-${{ matrix.os }}.txt
+
+      - name: SHA256 (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Set-Location target/release
+          $files = Get-ChildItem -File
+          $output = "../../proof/SHA256-windows.txt"
+          "SHA256 Checksums (Windows)" | Out-File $output -Encoding utf8
+          foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            "$h  $($f.Name)" | Out-File $output -Append -Encoding utf8
+          }
+
+      # -------- Collect ----------
+      - name: Collect output
+        run: |
+          mkdir -p out
+          cp -r target/release out/
+          cp -r proof out/
+          cp README.md out/ || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustppsharp-${{ matrix.os }}
+          path: out/
+
+  # ================================
+  # 릴리즈 생성
+  # ================================
+  release:
+    needs: [versioning, build]
+    if: needs.versioning.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release/
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.versioning.outputs.tag }}
+          name: "Rust++# (rustppsharp) Release — ${{ needs.versioning.outputs.tag }}"
+          body: |
+            ## Rust++# Auto Release
+            **Rust++#(rustppsharp)** — Rust → C++ → C# 스타일 하이브리드 언어  
+            이 릴리즈는 3 OS에서 자동 빌드되었습니다.
+
+            ✔ Rust++# 컴파일러  
+            ✔ ProofLedger  
+            ✔ SHA256 검증 파일  
+            ✔ 3OS 실행 파일 포함
+
+          files: release/**
+
+  # ================================
+  # 태그 중복 → 스킵
+  # ================================
+  skip:
+    needs: versioning
+    if: needs.versioning.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Tag already exists — release skipped." >> $GITHUB_STEP_SUMMARY
